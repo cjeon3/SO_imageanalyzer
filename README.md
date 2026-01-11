@@ -8,6 +8,93 @@ The Sound Object Analyzer processes participant drawings of perceived sound obje
 
 ---
 
+### Pipeline Overview
+
+The complete analysis workflow proceeds through the following stages:
+
+**1. Data Collection** (External to this tool)
+
+Participants draw perceived sound object shapes on a standardized 20x20 unit grid using a drawing interface. Each trial captures two shapes (red for diotic, blue for dichotic conditions) along with participant-indicated centroids. Drawing data including area measurements and centroid coordinates are recorded in a Google Sheets spreadsheet.
+
+**2. Data Export**
+
+Participant drawings are exported as PNG images with standardized filenames encoding participant ID, trial number, and frequency condition.
+
+**3. Ground Truth Retrieval** (Optional)
+
+The analyzer connects to Google Sheets via a read-only Apps Script API to retrieve participant-recorded centroid coordinates. These ground truth values take precedence over algorithmically computed centroids when available.
+
+**4. Image Processing**
+
+For each PNG image:
+- Color classification separates red and blue shapes
+- Connected component analysis isolates the primary shape from centroid markers
+- Radial contour extraction produces angle-aligned boundary representations
+- Centroid markers are detected and removed from overlay pixels
+
+**5. Composite Generation**
+
+Individual shapes are grouped by frequency condition and composited:
+- Semi-transparent overlays visualize shape distribution
+- Point-wise averaging of angle-aligned contours produces mean boundaries
+- Gaussian smoothing reduces high-frequency noise in averaged contours
+
+**6. Output**
+
+The tool produces composite PNG images for each frequency condition displaying overlaid shapes, average contours, and mean centroids with associated metadata.
+
+---
+
+### Google Sheets Integration
+
+#### Purpose
+
+The Google Sheets connection provides ground truth centroid coordinates recorded by participants during the drawing task. These coordinates represent the participant's intended sound source location, which may differ from the geometric center of the drawn shape.
+
+#### Architecture
+
+A Google Apps Script deployed as a web application serves as a read-only REST API. The script accesses the spreadsheet containing experimental data and returns JSON-formatted records.
+
+#### Spreadsheet Structure
+
+The expected column layout:
+
+| Column | Field | Description |
+|--------|-------|-------------|
+| A | Timestamp | Recording timestamp |
+| B | Participant | Participant identifier |
+| C | Response Number | Trial number |
+| D | Frequency | Stimulus frequency in Hz |
+| E | SPL | Sound pressure level in dB |
+| F | Shape Color | Condition indicator (red/blue) |
+| G | Area | Shape area in grid squares (units squared) |
+| H | Centroid X | X-coordinate in unit space (-10 to +10) |
+| I | Centroid Y | Y-coordinate in unit space (-10 to +10) |
+
+#### API Deployment
+
+The Apps Script requires configuration of the target spreadsheet ID and sheet name. Once deployed as a web application with public access, the script URL is entered into the Sound Object Analyzer interface.
+
+#### Data Flow
+
+1. The analyzer sends an HTTP GET request to the Apps Script URL
+2. The script reads all records from the configured spreadsheet (read-only operation)
+3. Records are returned as a JSON array containing participant, trial, frequency, color, area, and centroid fields
+4. The analyzer matches records to uploaded images by participant ID, trial number, frequency, and color
+5. Matched centroid coordinates are used as the reference point for radial contour extraction
+
+#### Record Matching
+
+For each processed image, the analyzer attempts to locate a corresponding spreadsheet record using the following criteria:
+- Participant identifier (case-insensitive string match)
+- Trial number (exact integer match)
+- Frequency (within 1 Hz tolerance)
+- Color (exact string match: "red" or "blue")
+
+When a match is found, the spreadsheet centroid coordinates are converted from unit space to pixel coordinates and used for all radial operations. Unmatched images use calculated centroids derived from the shape's geometric center.
+
+---
+
 ### Input Specifications
 
 **Image Format**: PNG files at 1000x1000 pixel resolution
@@ -217,6 +304,29 @@ Traditional contour extraction methods (e.g., marching squares) produce perimete
 **Centroid Source Priority**
 
 When ground truth centroids are available from external data sources, these take precedence over calculated centroids. Calculated centroids represent the geometric center of the drawn shape, which may differ from the participant's intended sound source location, particularly for asymmetric shapes.
+
+---
+
+### Google Apps Script Deployment
+
+#### Installation Procedure
+
+1. Navigate to https://script.google.com and create a new project
+2. Replace the default code with the provided Apps Script
+3. Configure the SHEET_ID constant with the target spreadsheet identifier (found in the spreadsheet URL between /d/ and /edit)
+4. Configure SHEET_NAME if the data tab has a non-default name
+5. Save the project
+6. Execute the testAPI() function to verify configuration and authorize access
+7. Deploy as a web application:
+   - Execute as: Script owner
+   - Access: Anyone
+8. Copy the deployment URL for use in the Sound Object Analyzer
+
+#### Security Considerations
+
+The Apps Script operates in read-only mode. The script uses only getValues() for data retrieval and contains no write operations (setValue, setValues, insertRows, deleteRows, or similar). The spreadsheet data cannot be modified through the API.
+
+The web application deployment with "Anyone" access allows the browser-based analyzer to retrieve data without authentication. The script accesses only the specifically configured spreadsheet; no other Google account data is exposed.
 
 ---
 
