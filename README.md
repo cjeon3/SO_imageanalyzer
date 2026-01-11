@@ -1,828 +1,233 @@
-# Sound Object Analyzer v2.2.56 — Comprehensive Documentation
+# Sound Object Analyzer v3.6
 
-## Overview
+## Technical Documentation
 
-The Sound Object Analyzer is a browser-based research tool developed for the UCI Hearing & Speech Lab's Sound Object Phenomenon studies. It processes participant drawings that represent how people perceive sound objects at various frequencies, generating publication-ready composite visualizations and statistical analyses.
+### Overview
 
-Participants use a companion drawing application to create **red shapes** (representing in-phase perception) and **blue shapes** (representing out-of-phase perception) around a reference circle at 11 standard frequencies.
-
----
-
-## Table of Contents
-
-1. [Supported Frequencies](#supported-frequencies)
-2. [Coordinate System](#coordinate-system)
-3. [Sampling System](#sampling-system)
-4. [Processing Pipeline](#processing-pipeline)
-5. [Color Detection](#color-detection)
-6. [Contour Extraction](#contour-extraction)
-7. [Centroid Calculation](#centroid-calculation)
-8. [Shape Resampling](#shape-resampling)
-9. [Extreme Overlap Handling](#extreme-overlap-handling)
-10. [Shape Averaging](#shape-averaging)
-11. [Area Calculations](#area-calculations)
-12. [Statistics (All Mean-Based)](#statistics-all-mean-based)
-13. [Google Sheets Integration](#google-sheets-integration)
-14. [Output Visualizations](#output-visualizations)
-15. [Key Constants](#key-constants)
+The Sound Object Analyzer processes participant drawings of perceived sound objects, extracting geometric representations suitable for quantitative analysis. The tool generates composite visualizations by frequency condition and computes average contours representing the central tendency of spatial representations across participants.
 
 ---
 
-## Supported Frequencies
+### Input Specifications
 
-The analyzer processes drawings at 11 standard frequencies (in Hz):
+**Image Format**: PNG files at 1000x1000 pixel resolution
 
-```
-31, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000
-```
+**Naming Convention**: `{ParticipantID}_{TrialNumber}_{Frequency}Hz.png`
 
-**Important**: There is no 5 Hz frequency. Files are parsed from filenames in the format:
-```
-ParticipantName_FrequencyHz_dB.png
-Example: "Diego G_31Hz_100dB.png"
-```
+**Coordinate System**: Images map to a Cartesian plane spanning -10 to +10 units on both axes, with the origin at image center (pixel 500, 500). The scale factor is 50 pixels per unit.
+
+**Color Encoding**: Each image contains two shapes representing different binaural phase conditions:
+- Red shapes: Diotic condition (interaural phase difference = 0)
+- Blue shapes: Dichotic condition (interaural phase difference = pi)
 
 ---
 
-## Coordinate System
+### Processing Pipeline
 
-The analyzer uses two coordinate systems that must be precisely matched to the drawing tool:
+#### 1. Color Classification
 
-### Canvas Coordinates (Pixel Space)
-- **Canvas size**: 1000 × 1000 pixels
-- **Origin**: Top-left corner (0, 0)
-- **Y-axis**: Increases downward
+Pixels undergo classification into discrete categories using a two-stage approach combining HSL (Hue, Saturation, Lightness) color space analysis with supplementary RGB threshold checks.
 
-### Unit/Grid Coordinates (Mathematical Space)
-- **Range**: -10 to +10 units in both X and Y
-- **Origin**: Center (0, 0) at pixel (500, 500)
-- **Y-axis**: Increases upward (standard mathematical convention)
-- **Scale**: 50 pixels per unit
+**HSL-Based Classification**
 
-### Conversion Formulas
+The HSL transformation follows the standard formulation where hue is computed as a value from 0 to 360 degrees, saturation and lightness as percentages from 0 to 100.
 
-**Canvas to Unit:**
-```javascript
-function canvasToUnit(x, y) {
-    return {
-        x: (x - 500) / 50,
-        y: (500 - y) / 50  // Y is inverted
-    };
-}
+Primary classification thresholds:
+- **White**: Lightness > 95%, or saturation < 8% with lightness > 85%
+- **Black**: Lightness < 5%, or saturation < 8% with lightness < 15%
+- **Gray**: Saturation < 6%
+- **Red**: Hue in [320, 360] or [0, 40], saturation >= 8%, lightness in [5, 95]
+- **Blue**: Hue in [170, 240], saturation >= 8%, lightness in [5, 95]
+- **Purple**: Hue in (240, 350), saturation >= 8%, lightness in [8, 92]
+
+**RGB-Based Supplementary Classification**
+
+To capture edge cases where HSL classification may fail (particularly for dark pixels affected by gridline overlap), additional RGB-based rules apply:
+
+- Purple detection: R > 40, B > 40, G < 0.9 * max(R, B), with min(R, B) / max(R, B) > 0.35
+- Red detection: R > 50, R > 1.2 * G, R > 1.1 * B
+- Blue detection: B > 50, B > 1.1 * G, B > 1.1 * R
+- Dark colored pixels (lightness < 30%): Assigned to the dominant RGB channel
+
+**Purple Pixel Handling**
+
+Purple pixels, which occur in regions where red and blue shapes overlap, are assigned to both color sets. This ensures that neither shape's contour is truncated at overlap regions.
+
+#### 2. Connected Component Analysis
+
+Following color classification, flood fill analysis identifies connected components within each color class using 8-connectivity (including diagonal neighbors). The algorithm employs a stack-based iterative approach to avoid recursion depth limitations.
+
+Components smaller than 30 pixels are discarded as noise. The largest component for each color is designated as the primary shape; smaller components (typically centroid markers placed by participants) are excluded from contour analysis.
+
+#### 3. Centroid Determination
+
+Shape centroids are determined by one of two methods:
+
+**Ground Truth Centroids** (when Google Sheets data is connected): Centroid coordinates are retrieved from an external spreadsheet containing participant-recorded positions. These coordinates, specified in unit space, are converted to pixel coordinates for subsequent radial sampling.
+
+**Calculated Centroids** (default): The arithmetic mean of all pixel coordinates within the largest connected component:
+
+```
+centroid_x = (1/N) * sum(x_i)
+centroid_y = (1/N) * sum(y_i)
 ```
 
-**Unit to Canvas:**
-```javascript
-function unitToCanvas(x, y) {
-    return {
-        x: x * 50 + 500,
-        y: 500 - y * 50  // Y is inverted
-    };
-}
-```
+where N is the pixel count and (x_i, y_i) are individual pixel coordinates.
 
-### Example
-Grid position (3, 3) corresponds to pixel position (650, 350):
-- x_pixel = 3 × 50 + 500 = 650
-- y_pixel = 500 - 3 × 50 = 350
+#### 4. Gap Filling
+
+To address potential discontinuities in shape boundaries (arising from drawing artifacts or color overlap regions), a radial gap detection algorithm identifies and fills missing segments.
+
+**Gap Detection**
+
+The shape boundary is analyzed at 720 angular positions (0.5 degree resolution). For each angle, the algorithm identifies the maximum radial distance from centroid to any pixel of the same color within an angular tolerance of 0.75 degrees.
+
+Gaps are defined as angular positions where either:
+- No pixels exist within the angular tolerance (null points)
+- The radial distance is less than 30% of the median radial distance across all valid angles
+
+**Gap Filling**
+
+For each contiguous gap region, the algorithm draws a straight line connecting the valid boundary points immediately preceding and following the gap. This linear interpolation preserves shape continuity without introducing artificial curvature.
+
+#### 5. Boundary Extraction
+
+Boundary pixels are identified as shape pixels having at least one 8-connected neighbor that does not belong to the shape. This produces a single-pixel-wide outline of the filled shape.
+
+#### 6. Radial Contour Extraction
+
+The contour is represented as a sequence of points sampled at uniform angular intervals from the centroid. This angular parameterization enables direct comparison and averaging across shapes of different sizes and aspect ratios.
+
+**Sampling Procedure**
+
+For each of N angular positions (default N = 1000, corresponding to 0.36 degree resolution):
+
+1. Compute the target angle: theta_i = (2 * pi * i) / N
+2. Identify all boundary pixels within angular tolerance (1.5 times the angular step)
+3. Select the boundary pixel at maximum radial distance from centroid
+4. Convert pixel coordinates to unit space coordinates
+
+**Truncation Handling**
+
+Points with radial distances below 25% of the median distance are marked as potentially truncated. These points are replaced via linear interpolation between the nearest valid points on either side of the truncated region.
+
+#### 7. Centroid Marker Removal
+
+Participant drawings typically include a cross-shaped (+) marker indicating the perceived centroid. This marker must be removed before generating composite overlays to prevent visual clutter.
+
+**Marker Detection**
+
+The algorithm scans radially outward from the calculated centroid at 1-degree angular increments, identifying continuous lines of pixels (arm detection). Two perpendicular arms (within 80-100 degrees of each other) with combined length exceeding 10 pixels indicate the presence of a cross marker.
+
+**Selective Removal**
+
+Marker pixels within the detected radius are removed, except those coinciding with the shape boundary. This preservation prevents gaps in the contour where the marker intersects the shape edge.
 
 ---
 
-## Sampling System
+### Composite Generation
 
-### Fixed N=1000 Samples
+#### Overlay Composition
 
-All contours in v2.2.56 are resampled to exactly **1000 evenly-spaced points**. This replaces the previous adaptive sampling system that varied based on perimeter length.
+For each frequency condition, individual shape overlays are composited using alpha blending. Each shape is rendered with user-specified opacity (default 5%), allowing visualization of shape distribution density.
 
-### Starting Point: Topmost
+The compositing formula for each pixel:
 
-Each contour starts from the **topmost point**:
-- In **pixel/canvas coordinates**: Smallest Y value (top of screen)
-- In **unit/grid coordinates**: Highest Y value (mathematically "up")
-
-### Direction: Clockwise
-
-Contours proceed **clockwise** from the starting point:
-- Visual direction: Top → Right → Bottom → Left → Top
-- Enforced via signed area calculation
-
-### Signed Area Formula for Direction Detection
-
-```javascript
-// Calculate signed area using shoelace formula
-let signedArea = 0;
-for (let i = 0; i < contour.length; i++) {
-    const p1 = contour[i];
-    const p2 = contour[(i + 1) % contour.length];
-    signedArea += (p1.x * p2.y - p2.x * p1.y);
-}
-signedArea *= 0.5;
-
-// In unit coordinates (Y up):
-// Positive = counter-clockwise
-// Negative = clockwise
-if (signedArea > 0) {
-    // Reverse to make clockwise (keep first point, reverse rest)
-    contour = [contour[0], ...contour.slice(1).reverse()];
-}
 ```
+output_alpha = 1 - (1 - alpha_1) * (1 - alpha_2) * ... * (1 - alpha_n)
+output_color = sum(color_i * alpha_i * product(1 - alpha_j for j < i)) / output_alpha
+```
+
+This over-composition method produces darker regions where more shapes overlap, providing immediate visual feedback on the spatial consistency of representations.
+
+#### Average Contour Computation
+
+The average contour represents the central tendency of shape boundaries across participants.
+
+**Centroid Alignment**
+
+Each contour is translated such that its centroid lies at the origin:
+
+```
+contour_centered[i] = contour[i] - centroid
+```
+
+**Point-wise Averaging**
+
+Because contours share the same angular parameterization, corresponding points can be averaged directly by index:
+
+```
+average_contour[i] = (1/M) * sum(contour_j_centered[i]) + mean_centroid
+```
+
+where M is the number of valid shapes and mean_centroid is the arithmetic mean of all shape centroids.
+
+**Gaussian Smoothing**
+
+The averaged contour undergoes iterative smoothing using a discrete Gaussian kernel approximation with weights [1, 4, 6, 4, 1] (normalized sum = 16). Each iteration updates point positions as:
+
+```
+smoothed[i] = original[i] + strength * (gaussian_weighted_mean[i] - original[i])
+```
+
+Default parameters: 3 iterations at 0.5 strength. Smoothing reduces high-frequency noise while preserving overall shape characteristics.
 
 ---
 
-## Processing Pipeline
+### Output Specifications
 
-### Step 1: File Upload
-- Accept PNG files or ZIP archives
-- Parse filenames to extract participant name, frequency, and trial number
-- Group files by frequency
+**Composite Images**: PNG files at 1000x1000 pixels containing:
+- Coordinate grid with axis labels
+- Reference circle at radius 3 units
+- Semi-transparent overlay of all individual shapes
+- Average contour line (4-pixel stroke width)
+- Mean centroid markers
 
-### Step 2: Google Sheets Integration (Optional)
-- Connect to Google Apps Script web app
-- Fetch ground-truth centroid and area data
-- Build trial mapping from ZIP folder names
+**File Naming**: `composite_{frequency}Hz.png`
 
-### Step 3: Image Processing
-For each PNG image:
-
-1. **Color Detection**: Identify red and blue pixels using color thresholds
-2. **Component Detection**: Find connected components using flood fill
-3. **Marker Removal**: Remove centroid marker pixels (cross + circle)
-4. **Boundary Extraction**: Trace outer contour of each shape
-5. **Gap Filling**: Close any gaps in the contour
-6. **Resampling**: Resample to N=1000 points, topmost start, clockwise
-7. **Centroid Calculation**: Calculate centroid from resampled contour
-8. **Translation**: Translate shape to match Sheets centroid (if available)
-
-### Step 4: Shape Averaging
-- Group shapes by frequency and color
-- Align shapes to their centroids
-- Average corresponding points across all shapes
-- Apply area normalization (optional)
-- Final resampling to N=1000
-
-### Step 5: Visualization & Statistics
-- Generate composite images for each frequency
-- Calculate area and centroid statistics
-- Display extreme overlap replacements
-- Validate against Google Sheets data
+**Metadata Display**: Each composite includes text indicating:
+- Sample count per color (N)
+- Mean centroid coordinates
+- Centroid shift distance between conditions
 
 ---
 
-## Color Detection
+### Parameter Reference
 
-### Red Pixel Detection
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| Radial Samples | 1000 | 1000-5000 | Angular sampling resolution for contour extraction |
+| Overlay Opacity | 5% | 5-50% | Alpha value for individual shape overlays |
+| Contour Smoothing | 3 | 0-10 | Gaussian smoothing iterations for average contour |
 
-Red pixels are detected using multiple criteria:
-
-```javascript
-function isRedPixel(r, g, b, a) {
-    if (a < 128) return false;  // Skip transparent pixels
-    
-    // Primary: Strong red channel dominance
-    if (r > 150 && r > g + 30 && r > b + 30) return true;
-    
-    // Secondary: Medium-strong red with clear dominance
-    if (r > 100 && r > g - 20) {
-        // Check for various red shades including darker reds
-        if (r > b && g < 150) return true;
-    }
-    
-    // Tertiary: HSV-based detection for edge pixels
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    const saturation = max > 0 ? (max - min) / max : 0;
-    
-    if (saturation > 0.40 && r > g && r > b) {
-        const distToRed = Math.sqrt((r-239)**2 + (g-68)**2 + (b-68)**2);
-        if (distToRed < 120) return true;
-    }
-    
-    return false;
-}
-```
-
-### Blue Pixel Detection
-
-Similar multi-criteria approach for blue:
-
-```javascript
-function isBluePixel(r, g, b, a) {
-    if (a < 128) return false;
-    
-    // Primary: Strong blue channel dominance
-    if (b > 150 && b > r + 20 && b > g - 20) return true;
-    
-    // Secondary: Medium-strong blue
-    if (b > 100 && b > g - 20) {
-        if (b > r && r < 180) return true;
-    }
-    
-    // Tertiary: HSV-based detection
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    const saturation = max > 0 ? (max - min) / max : 0;
-    
-    if (saturation > 0.40 && b > r && b > g) {
-        const distToBlue = Math.sqrt((r-59)**2 + (g-130)**2 + (b-246)**2);
-        if (distToBlue < 100) return true;
-    }
-    
-    return false;
-}
-```
-
-### Reference Colors
-- **Red**: RGB(239, 68, 68) — Tailwind red-500 (#ef4444)
-- **Blue**: RGB(59, 130, 246) — Tailwind blue-500 (#3b82f6)
-- **Color Tolerance**: 80 units in RGB space
+**Angular Resolution**: At 1000 samples, contour points are spaced at 0.36 degrees. Increasing to 5000 samples provides 0.072 degree resolution, beneficial for shapes with fine angular detail.
 
 ---
 
-## Contour Extraction
+### Methodological Considerations
 
-### Connected Component Analysis
+**Color Overlap Regions**
 
-Pixels of each color are grouped into connected components using 8-connectivity flood fill:
+The assignment of purple pixels to both red and blue sets ensures that neither condition's contour is artificially truncated where shapes overlap. This is particularly relevant for low-frequency conditions where sound object representations may have substantial spatial overlap.
 
-```javascript
-function findConnectedComponents(pixels, width, height) {
-    // Create pixel set for O(1) lookup
-    const pixelSet = new Set(pixels.map(p => `${p.x},${p.y}`));
-    const visited = new Set();
-    const components = [];
-    
-    for (const pixel of pixels) {
-        if (visited.has(`${pixel.x},${pixel.y}`)) continue;
-        
-        // Flood fill to find connected component
-        const component = floodFill(pixel.x, pixel.y);
-        if (component.length > 0) {
-            components.push(component);
-        }
-    }
-    
-    return components;
-}
-```
+**Radial vs. Cartesian Sampling**
 
-### Boundary Extraction
+Traditional contour extraction methods (e.g., marching squares) produce perimeter-ordered point sequences unsuitable for direct averaging, as corresponding anatomical features may appear at different indices. Radial sampling from a common reference point (centroid) ensures that points at the same angular position across shapes represent comparable spatial directions, enabling meaningful point-wise averaging.
 
-The outer boundary is extracted by identifying edge pixels:
+**Centroid Source Priority**
 
-```javascript
-function extractBoundaryFromFilledPixels(filledPixels) {
-    const pixelSet = new Set(filledPixels.map(p => `${p.x},${p.y}`));
-    const boundary = [];
-    
-    // 8-direction neighbors
-    const dx = [1, 1, 0, -1, -1, -1, 0, 1];
-    const dy = [0, 1, 1, 1, 0, -1, -1, -1];
-    
-    for (const p of filledPixels) {
-        // Check if any neighbor is NOT in the shape
-        let isEdge = false;
-        for (let d = 0; d < 8; d++) {
-            const nx = p.x + dx[d];
-            const ny = p.y + dy[d];
-            if (!pixelSet.has(`${nx},${ny}`)) {
-                isEdge = true;
-                break;
-            }
-        }
-        
-        if (isEdge) {
-            boundary.push({ x: p.x, y: p.y });
-        }
-    }
-    
-    return boundary;
-}
-```
-
-### Boundary Ordering
-
-Boundary pixels are ordered sequentially by following adjacent pixels:
-
-1. Start with topmost-leftmost point
-2. Find nearest unvisited neighbor (8-connectivity)
-3. Prefer neighbors that continue in the same direction
-4. Continue until all boundary pixels are visited
+When ground truth centroids are available from external data sources, these take precedence over calculated centroids. Calculated centroids represent the geometric center of the drawn shape, which may differ from the participant's intended sound source location, particularly for asymmetric shapes.
 
 ---
 
-## Centroid Calculation
+### Dependencies
 
-The centroid is calculated as the **arithmetic mean** of all N=1000 resampled contour points:
-
-```javascript
-function calculateContourCentroidLikeDrawingTool(resampledContour) {
-    if (!resampledContour || resampledContour.length === 0) {
-        return { x: 0, y: 0 };
-    }
-    
-    let sumX = 0, sumY = 0;
-    for (const p of resampledContour) {
-        sumX += p.x;
-        sumY += p.y;
-    }
-    
-    return {
-        x: sumX / resampledContour.length,
-        y: sumY / resampledContour.length
-    };
-}
-```
-
-This matches the drawing tool's approach where the centroid is the mean of uniformly-sampled contour points.
+- JSZip 3.10.1: ZIP archive extraction
+- FileSaver.js 2.0.5: Client-side file download
+- Tailwind CSS: Interface styling
 
 ---
 
-## Shape Resampling
+### Version History
 
-### Main Resampling Function
-
-```javascript
-function resampleContour(contour, targetSamples) {
-    if (contour.length < 2) return contour;
-    
-    // Step 1: Find topmost point (smallest Y in canvas coordinates)
-    let topmostIndex = 0;
-    let topmostY = contour[0].y;
-    for (let i = 1; i < contour.length; i++) {
-        if (contour[i].y < topmostY) {
-            topmostY = contour[i].y;
-            topmostIndex = i;
-        }
-    }
-    
-    // Step 2: Rotate contour to start from topmost point
-    let rotatedContour = [
-        ...contour.slice(topmostIndex),
-        ...contour.slice(0, topmostIndex)
-    ];
-    
-    // Step 3: Ensure clockwise direction
-    let signedArea = 0;
-    for (let i = 0; i < rotatedContour.length; i++) {
-        const p1 = rotatedContour[i];
-        const p2 = rotatedContour[(i + 1) % rotatedContour.length];
-        signedArea += (p1.x * p2.y - p2.x * p1.y);
-    }
-    signedArea *= 0.5;
-    
-    if (signedArea > 0) {  // Counter-clockwise, reverse
-        rotatedContour = [rotatedContour[0], ...rotatedContour.slice(1).reverse()];
-    }
-    
-    // Step 4: Calculate total path length
-    let totalLength = 0;
-    const segmentLengths = [];
-    for (let i = 0; i < rotatedContour.length; i++) {
-        const p1 = rotatedContour[i];
-        const p2 = rotatedContour[(i + 1) % rotatedContour.length];
-        const len = Math.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2);
-        segmentLengths.push(len);
-        totalLength += len;
-    }
-    
-    // Step 5: Resample to exactly targetSamples points
-    const resampled = [];
-    let currentDistance = 0;
-    let segmentIndex = 0;
-    
-    for (let sampleNum = 1; sampleNum <= targetSamples; sampleNum++) {
-        const targetDistance = ((sampleNum - 1) / targetSamples) * totalLength;
-        
-        // Find segment containing target distance
-        while (segmentIndex < segmentLengths.length - 1 && 
-               currentDistance + segmentLengths[segmentIndex] < targetDistance) {
-            currentDistance += segmentLengths[segmentIndex];
-            segmentIndex++;
-        }
-        
-        // Interpolate within segment
-        const remainingDist = targetDistance - currentDistance;
-        let progress = segmentLengths[segmentIndex] > 0 ? 
-            remainingDist / segmentLengths[segmentIndex] : 0;
-        progress = Math.max(0, Math.min(1, progress));
-        
-        const p1 = rotatedContour[segmentIndex];
-        const p2 = rotatedContour[(segmentIndex + 1) % rotatedContour.length];
-        
-        resampled.push({
-            x: p1.x + (p2.x - p1.x) * progress,
-            y: p1.y + (p2.y - p1.y) * progress
-        });
-    }
-    
-    return resampled;
-}
-```
-
-### Geometric Properties Preserved
-
-The resampling preserves all geometric properties:
-
-1. **Shape**: Points are interpolated along the original path
-2. **Area**: Shoelace formula on 1000 points gives accurate area
-3. **Centroid**: Mean of 1000 evenly-spaced points
-4. **Perimeter**: Sum of distances between consecutive points
-
----
-
-## Extreme Overlap Handling
-
-When red shapes are severely occluded by blue shapes (drawn on top), the analyzer detects and handles this:
-
-### Detection Criteria
-```javascript
-const EXTREME_OVERLAP_THRESHOLD = 0.30;
-
-// Red has < 30% of blue's pixel count = extreme overlap
-if (redPixelCount < bluePixelCount * EXTREME_OVERLAP_THRESHOLD) {
-    // Handle extreme overlap
-}
-```
-
-### Replacement Strategy
-
-When extreme overlap is detected:
-
-1. Use blue's already-traced contour
-2. Translate it to red's centroid position (from Sheets data)
-3. Mark the shape as `copiedFromBlue: true`
-4. Track the replacement for reporting
-
-```javascript
-const dx = redCentroid.x - blueCentroid.x;
-const dy = redCentroid.y - blueCentroid.y;
-
-const translatedContour = blueShape.contour.map(p => ({
-    x: p.x + dx,
-    y: p.y + dy
-}));
-```
-
-### Replacement Tracking
-
-All replacements are tracked and displayed:
-- Total count by color (red/blue)
-- Breakdown by frequency
-- Participant and trial details
-
----
-
-## Shape Averaging
-
-### Contour-Only Averaging (Default)
-
-```javascript
-function calculateAverageShape(shapes) {
-    // 1. Resample all shapes to N=1000
-    const resampledShapes = shapes.map(shape => {
-        const pixelContour = shape.contour.map(p => unitToCanvas(p.x, p.y));
-        const resampledPixels = resampleContour(pixelContour, 1000);
-        return resampledPixels.map(p => canvasToUnit(p.x, p.y));
-    });
-    
-    // 2. Align to centroids (translate each to origin)
-    const alignedShapes = alignContoursToCentroid(resampledShapes);
-    
-    // 3. Average corresponding points
-    const avgContour = [];
-    for (let i = 0; i < 1000; i++) {
-        let sumX = 0, sumY = 0;
-        for (const shape of alignedShapes) {
-            sumX += shape.contour[i].x;
-            sumY += shape.contour[i].y;
-        }
-        avgContour.push({
-            x: sumX / shapes.length + avgOffsetX,
-            y: sumY / shapes.length + avgOffsetY
-        });
-    }
-    
-    // 4. Final resample (ensures topmost start, clockwise)
-    return resampleContourLikeDrawingTool(avgContour);
-}
-```
-
-### Area-Normalized Averaging (Optional)
-
-When "Contour + Area Normalization" mode is selected:
-
-```javascript
-function calculateAverageShapeWithAreaNormalization(shapes) {
-    // 1. Calculate mean area of all input shapes
-    const areas = shapes.map(s => calculateContourArea(s.contour));
-    const meanArea = areas.reduce((a, b) => a + b, 0) / areas.length;
-    
-    // 2. Average contours (same as above)
-    const avgContour = calculateAverageShape(shapes);
-    
-    // 3. Calculate area of averaged contour
-    const avgArea = calculateContourArea(avgContour);
-    
-    // 4. Scale to match mean area
-    const scaleFactor = Math.sqrt(meanArea / avgArea);
-    
-    // 5. Scale around centroid
-    const scaledContour = avgContour.map(p => ({
-        x: cx + (p.x - cx) * scaleFactor,
-        y: cy + (p.y - cy) * scaleFactor
-    }));
-    
-    return resampleContourLikeDrawingTool(scaledContour);
-}
-```
-
----
-
-## Area Calculations
-
-### Shoelace Formula
-
-Area is calculated using the Shoelace formula on the contour points:
-
-```javascript
-function calculateContourArea(contour) {
-    if (!contour || contour.length < 3) return 0;
-    
-    let area = 0;
-    for (let i = 0; i < contour.length; i++) {
-        const j = (i + 1) % contour.length;
-        area += contour[i].x * contour[j].y;
-        area -= contour[j].x * contour[i].y;
-    }
-    
-    return Math.abs(area / 2);
-}
-```
-
-### Unit System for Area
-- Area is in **units²** (square grid units)
-- 1 unit = 50 pixels on the 1000×1000 canvas
-- Reference circle: radius = 3 units, area = π × 3² ≈ 28.27 units²
-
----
-
-## Statistics (All Mean-Based)
-
-All statistics in v2.2.56 use **mean** (arithmetic average), not median.
-
-### Area Statistics
-
-```javascript
-function calculateAreaStatistics(shapes) {
-    const areas = shapes.map(s => calculateContourArea(s.contour));
-    
-    // Mean
-    const sum = areas.reduce((acc, a) => acc + a, 0);
-    const mean = sum / areas.length;
-    
-    // Standard Deviation (using mean)
-    const squaredDiffs = areas.map(a => (a - mean) ** 2);
-    const variance = squaredDiffs.reduce((sum, d) => sum + d, 0) / areas.length;
-    const stdDev = Math.sqrt(variance);
-    
-    // Min and Max
-    const min = Math.min(...areas);
-    const max = Math.max(...areas);
-    
-    return { mean, stdDev, min, max, areas };
-}
-```
-
-### Centroid Statistics
-
-```javascript
-function calculateCentroidStatistics(shapes) {
-    const xCoords = shapes.map(s => s.centroid.x);
-    const yCoords = shapes.map(s => s.centroid.y);
-    
-    // Mean X and Y
-    const meanX = xCoords.reduce((a, b) => a + b, 0) / xCoords.length;
-    const meanY = yCoords.reduce((a, b) => a + b, 0) / yCoords.length;
-    
-    // Standard Deviations
-    const stdDevX = Math.sqrt(
-        xCoords.map(x => (x - meanX)**2).reduce((a, b) => a + b, 0) / xCoords.length
-    );
-    const stdDevY = Math.sqrt(
-        yCoords.map(y => (y - meanY)**2).reduce((a, b) => a + b, 0) / yCoords.length
-    );
-    
-    return { meanX, meanY, stdDevX, stdDevY };
-}
-```
-
-### Mean Radius
-
-```javascript
-function calculateMeanRadius(shapes) {
-    const shapeRadii = shapes.map(shape => {
-        const cx = shape.centroid.x;
-        const cy = shape.centroid.y;
-        
-        // Mean distance from centroid to all contour points
-        const distances = shape.contour.map(p => 
-            Math.sqrt((p.x - cx)**2 + (p.y - cy)**2)
-        );
-        return distances.reduce((a, b) => a + b, 0) / distances.length;
-    });
-    
-    // Mean of all shape radii
-    return shapeRadii.reduce((a, b) => a + b, 0) / shapeRadii.length;
-}
-```
-
----
-
-## Google Sheets Integration
-
-### Data Structure
-
-The analyzer expects Google Sheets data with these columns:
-- **Column A**: Participant name
-- **Column B**: Trial number
-- **Column C**: Frequency (Hz)
-- **Column D**: Color ("red" or "blue")
-- **Column E**: Centroid X (units)
-- **Column F**: Centroid Y (units)
-- **Column G**: Area (units²)
-
-### Lookup Function
-
-```javascript
-function lookupSheetsData(participant, trial, frequency, color) {
-    if (!sheetsData) return null;
-    
-    const record = sheetsData.find(row =>
-        row.participant?.toLowerCase() === participant.toLowerCase() &&
-        row.trial?.toString() === trial.toString() &&
-        parseFloat(row.frequency) === frequency &&
-        row.color?.toLowerCase() === color.toLowerCase()
-    );
-    
-    if (record) {
-        return {
-            centroid: { x: parseFloat(record.centroidX), y: parseFloat(record.centroidY) },
-            area: parseFloat(record.area)
-        };
-    }
-    
-    return null;
-}
-```
-
-### Centroid Translation
-
-When Sheets data is available, shapes are translated to match the ground-truth centroid:
-
-```javascript
-function translateShapeToSheetsCentroid(rawPixels, contour, extractedCentroid, sheetsCentroid) {
-    const targetPixel = unitToCanvas(sheetsCentroid.x, sheetsCentroid.y);
-    
-    const offsetX = targetPixel.x - extractedCentroid.x;
-    const offsetY = targetPixel.y - extractedCentroid.y;
-    
-    const translatedContour = contour.map(p => ({
-        x: p.x + offsetX,
-        y: p.y + offsetY
-    }));
-    
-    return { contour: translatedContour, centroid: sheetsCentroid };
-}
-```
-
----
-
-## Output Visualizations
-
-### Composite Image Components
-
-Each frequency composite includes:
-
-1. **Grid**: -10 to +10 unit grid with axis labels
-2. **Reference Circle**: Gray dashed circle, radius = 3 units
-3. **Individual Shapes**: Semi-transparent gray outlines (α=0.3)
-4. **Red Average**: Bold red contour (5px line)
-5. **Blue Average**: Bold blue contour (5px line)
-6. **Statistics**: N and mean radius for each color
-7. **Frequency Label**: Displayed at top center
-
-### Drawing Order
-
-```
-1. White background
-2. Grid lines and labels
-3. Reference circle (dashed gray)
-4. Individual red shapes (gray, α=0.3)
-5. Individual blue shapes (gray, α=0.3)
-6. Red average contour (solid red, 5px)
-7. Blue average contour (solid blue, 5px)
-8. Text labels (frequency, statistics)
-```
-
----
-
-## Key Constants
-
-```javascript
-// Canvas and coordinate system
-const CANVAS_SIZE = 1000;              // 1000×1000 pixels
-const UNIT_RANGE = 10;                 // -10 to +10 units
-const SCALE_FACTOR = 50;               // 50 pixels per unit
-const CENTER = 500;                    // Center pixel coordinate
-
-// Reference circle
-const REFERENCE_CIRCLE_RADIUS_UNITS = 3;   // 3 grid units
-const REFERENCE_CIRCLE_RADIUS_PX = 150;    // 150 pixels
-
-// Sampling
-const MIN_CONTOUR_SAMPLES = 1000;      // Fixed N=1000 samples
-
-// Color detection
-const RED_COLOR = { r: 239, g: 68, b: 68 };    // #ef4444
-const BLUE_COLOR = { r: 59, g: 130, b: 246 };  // #3b82f6
-const COLOR_TOLERANCE = 80;
-
-// Extreme overlap
-const EXTREME_OVERLAP_THRESHOLD = 0.30;  // 30%
-
-// Marker detection
-const MARKER_CROSS_ARM = 12;           // Cross arm length in pixels
-const MARKER_CIRCLE_RADIUS = 14;       // Circle radius in pixels
-const MARKER_BBOX_MIN = 20;            // Minimum bounding box
-const MARKER_BBOX_MAX = 45;            // Maximum bounding box
-const MARKER_PIXELS_MIN = 100;         // Minimum pixel count
-const MARKER_PIXELS_MAX = 600;         // Maximum pixel count
-```
-
----
-
-## Filename Conventions
-
-### Input Files
-```
-{Participant}_{Frequency}Hz_{dB}dB.png
-Example: "Diego G_31Hz_100dB.png"
-```
-
-### ZIP Archives
-```
-{Participant}_drawings.zip
-Contents: Multiple PNG files for that participant
-```
-
-### Output Files
-```
-composite_{Frequency}Hz.png
-Example: "composite_1000Hz.png"
-```
-
----
-
-## Version History
-
-### v2.2.56 (Current)
-- Fixed N=1000 samples for all shapes (replaces adaptive sampling)
-- Topmost starting point for all contours
-- Clockwise direction enforced
-- All statistics changed from median to mean
-- Extreme overlap replacement tracking and display
-- Geometric properties preserved through resampling
-
-### Previous Versions
-- v2.2.55: Code review and cleanup
-- v2.2.24: Small area threshold adjustment
-- v2.2.x: Various bug fixes and improvements
-
----
-
-## Technical Notes
-
-### Browser Compatibility
-- Requires modern browser with ES6+ support
-- Uses HTML5 Canvas API
-- Requires File API for uploads
-- Uses async/await for file processing
-
-### Dependencies (CDN-loaded)
-- Tailwind CSS (styling)
-- JSZip (ZIP file handling)
-- FileSaver.js (download functionality)
-
-### Performance Considerations
-- Large ZIP files may take time to process
-- N=1000 samples provides good balance of accuracy and performance
-- Web Workers could be added for parallel processing
-
----
-
-## Contact
-
-UCI Hearing & Speech Lab  
-Sound Object Analyzer — Cartesian Pipeline v2.2.56
-
-For questions about methodology or calculations, refer to this documentation or the inline code comments.
+**v3.6**: Color-specific radial tracing with purple pixel dual-assignment; conservative gap fill thresholds; centroid marker detection and removal
